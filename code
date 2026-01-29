@@ -1,0 +1,481 @@
+import base64
+import io
+import re
+import numpy as np
+import plotly.graph_objects as go
+import json
+
+
+from dash import Dash, dcc, html, Input, Output, State, ALL, callback_context
+from dash.exceptions import PreventUpdate
+
+
+# =========================
+# GLOBAL CONFIG
+# =========================
+FS = 19200.0  # Hz
+data_global = None
+labels = []
+selected_label_idx = None
+
+
+# Hệ số giảm mẫu cho Envelope
+DOWNSAMPLE_FACTOR = 10
+
+
+# CẤU HÌNH NHÃN CỐ ĐỊNH THEO YÊU CẦU
+LABEL_OPTIONS = {
+    "Flexion": "#d62728",    # Đỏ
+    "Rest": "#2ca02c",       # Xanh lá
+    "Extension": "#ff7f0e"   # Cam
+}
+label_color_map = LABEL_OPTIONS
+
+
+# =========================
+# SIGNAL PROCESSING
+# =========================
+def emg_envelope(x, win=100):
+    """Tính toán đường bao (envelope) của tín hiệu EMG bằng Rectification và Moving Average."""
+    x = np.abs(x)
+    kernel = np.ones(win) / win
+    return np.convolve(x, kernel, mode="same")
+
+
+# =================================================================
+# LOAD TXT
+# =================================================================
+def load_adc_txt(text):
+    """
+    Chỉ trích xuất các giá trị ADC từ các dòng không phải là metadata (Viking Natus format).
+    """
+    data_lines = []
+   
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(';') or line.startswith('[') or '=' in line:
+            continue
+        if re.search(r"[-+]?\d+", line):
+            line = line.replace('/', ' ').replace(',', ' ')
+            data_lines.append(line)
+           
+    data_text_block = " ".join(data_lines)
+    nums_str = re.findall(r"[-+]?\d+", data_text_block)
+   
+    if not nums_str:
+        nums_str = re.findall(r"[-+]?\d+", text.replace('/', ' ').replace(',', ' '))
+        if not nums_str:
+             raise ValueError("Không tìm thấy dữ liệu số ADC hợp lệ.")
+
+
+    values = np.array([float(n) for n in nums_str], dtype=float)
+   
+    MIN_SAMPLES = 200
+    if len(values) < MIN_SAMPLES:
+        raise ValueError(f"Số mẫu quá ít ({len(values)}). Cần tối thiểu {MIN_SAMPLES} mẫu để xử lý.")
+
+
+    time = np.arange(len(values)) / FS
+    print(f"DEBUG: Tải thành công {len(values)} mẫu @ {FS} Hz. Tổng thời gian: {time[-1]:.2f}s")
+
+
+    return {
+        "time": time,
+        "ch0": values
+    }
+
+
+# =========================
+# UTILITY FUNCTION
+# =========================
+def render_label_list():
+    """Tạo HTML hiển thị danh sách các nhãn đã lưu"""
+    global selected_label_idx
+   
+    label_elements = []
+    for i, l in enumerate(labels):
+        is_selected = (i == selected_label_idx)
+       
+        # SỬ DỤNG MÀU CỐ ĐỊNH CỦA NHÃN ĐÃ LƯU
+        style = {
+            "color": l["color"],
+            "cursor": "pointer",
+            "padding": "5px 0",
+            "border-left": f"5px solid {l['color']}", # Dùng màu cố định
+            "padding-left": "10px",
+            "margin-bottom": "5px",
+            "backgroundColor": "#e0e0e0" if is_selected else "white", # Màu nền xám nhạt khi được chọn
+            "fontWeight": "bold" if is_selected else "normal"
+        }
+       
+        label_elements.append(
+            html.Div(
+                f"[{l['channel']}] {l['label']} ({l['start']:.4f}s - {l['end']:.4f}s)",
+                id={"type": "label-item", "index": i},
+                n_clicks=0,
+                style=style
+            )
+        )
+    return label_elements
+
+
+# =========================
+# APP LAYOUT
+# =========================
+app = Dash(__name__)
+app.layout = html.Div(style={"width": "85%", "margin": "auto", "font-family": "Arial"}, children=[
+
+
+    html.H2("📊 Công cụ Phân tích & Gắn nhãn Tín hiệu ADC/EMG", style={"border-bottom": "2px solid #ccc", "padding-bottom": "10px"}),
+
+
+    dcc.Upload(
+        id="upload-data",
+        children=html.Button("📂 Tải File TXT", style={"padding": "10px", "cursor": "pointer", "backgroundColor": "#e0f7fa", "border": "none", "borderRadius": "5px"}),
+        multiple=False
+    ),
+    html.Div(id="file-name", style={"margin-top": "10px", "font-style": "italic"}),
+
+
+    dcc.Dropdown(id="channel-select", placeholder="Chọn Kênh Tín hiệu (Mặc định: ch0)", style={"margin-top": "15px"}),
+
+
+    dcc.Graph(
+        id="emg-graph",
+        style={"height": "600px"},
+        config={'scrollZoom': True, 'displayModeBar': True}
+    ),
+
+
+    html.Div(id="selected-range", style={"fontWeight": "bold", "margin-top": "10px"}),
+
+
+    dcc.Store(id="range-store"),
+    dcc.Store(id="selected-label-data-store"), # STORE MỚI ĐỂ LƯU DATA CỦA NHÃN ĐANG CHỌN
+
+
+    html.Div([
+        dcc.Dropdown(
+            id="label-select",
+            placeholder="Chọn tên nhãn",
+            options=[{'label': k, 'value': k} for k in LABEL_OPTIONS.keys()],
+            style={"width": "250px", "margin-right": "10px", "padding": "5px", "display": "inline-block"}
+        ),
+        html.Button("Lưu Nhãn (Save)", id="save-btn", style={"margin-right": "5px", "backgroundColor": "#c8e6c9", "border": "none"}),
+        html.Button("Cập Nhật Nhãn (Update)", id="update-btn", style={"margin-right": "5px", "backgroundColor": "#fff9c4", "border": "none"}),
+        html.Button("Xóa Nhãn Đã Chọn (Delete)", id="delete-btn", style={"backgroundColor": "#ffcdd2", "border": "none"}),
+        html.Button("Xuất Dữ liệu Gắn nhãn (Export)", id="export-btn", style={"float": "right", "backgroundColor": "#bbdefb", "border": "none"})
+    ], style={"margin-top": "10px"}),
+
+
+    html.Hr(),
+    html.H4("Danh sách Nhãn:", style={"margin-top": "20px"}),
+    html.Div(id="label-list"),
+    dcc.Download(id="download-project")
+])
+
+
+# =========================
+# CALLBACKS
+# =========================
+
+
+# 1. LOAD FILE (Không thay đổi)
+@app.callback(
+    Output("channel-select", "options"),
+    Output("channel-select", "value"),
+    Output("file-name", "children"),
+    Input("upload-data", "contents"),
+    State("upload-data", "filename")
+)
+def load_txt(contents, filename):
+    global data_global, labels, selected_label_idx
+
+
+    if contents is None:
+        raise PreventUpdate
+
+
+    try:
+        labels.clear()
+        selected_label_idx = None
+
+
+        _, content = contents.split(",", 1)
+        text = base64.b64decode(content).decode("utf-8", errors="ignore")
+
+
+        data_global = load_adc_txt(text)
+
+
+        channels = [k for k in data_global if k != "time"]
+        return (
+            [{"label": f"Kênh {c}", "value": c} for c in channels],
+            channels[0],
+            f"✅ Đã tải file: {filename}"
+        )
+
+
+    except Exception as e:
+        data_global = None
+        print("LOAD ERROR:", e)
+        return [], None, f"❌ Lỗi đọc file: {e}"
+
+
+# 2. PLOT TÍN HIỆU (Không thay đổi)
+@app.callback(
+    Output("emg-graph", "figure"),
+    Input("channel-select", "value"),
+    Input("label-list", "children")
+)
+def plot_signal(ch, _):
+    if data_global is None or ch is None:
+        fig = go.Figure()
+        fig.update_layout(
+            annotations=[
+                dict(
+                    text="Vui lòng tải file TXT để hiển thị tín hiệu",
+                    xref="paper", yref="paper",
+                    showarrow=False,
+                    font=dict(size=20, color="gray")
+                )
+            ]
+        )
+        return fig
+
+
+    # 1. TÍNH TOÁN DỮ LIỆU VÀ GIẢM MẪU
+    time_raw = data_global["time"]
+    win_size = min(100, len(data_global[ch]) // 2)
+    y_envelope = emg_envelope(data_global[ch], win=win_size)
+
+
+    time_plot = time_raw[::DOWNSAMPLE_FACTOR]
+    y_envelope_plot = y_envelope[:len(time_raw)][::DOWNSAMPLE_FACTOR]
+
+
+    DOWNSAMPLE_RAW = DOWNSAMPLE_FACTOR * 2
+    y_raw_plot = data_global[ch][:len(time_raw)][::DOWNSAMPLE_RAW]
+    time_raw_plot = time_raw[::DOWNSAMPLE_RAW]
+   
+    fig = go.Figure()
+
+
+    fig.add_trace(go.Scattergl(
+        x=time_raw_plot,
+        y=y_raw_plot,
+        mode="lines",
+        name="Tín hiệu Thô (Giảm mẫu)",
+        line={"width": 0.5, "color": "gray"},
+        opacity=0.5
+    ))
+   
+    fig.add_trace(go.Scattergl(
+        x=time_plot,
+        y=y_envelope_plot,
+        mode="lines",
+        name="Đường bao (Envelope)",
+        line={"width": 1.5, "color": "orange"}
+    ))
+   
+    # Vẽ các vùng nhãn đã lưu
+    for l in labels:
+        if l["channel"] == ch:
+            fig.add_vrect(
+                x0=l["start"], x1=l["end"],
+                fillcolor=l["color"], opacity=0.35, line_width=0,
+                annotation_text=l["label"], annotation_position="top left",
+                annotation_font_color=l["color"]
+            )
+   
+    max_time = time_raw[-1]
+   
+    fig.update_layout(
+        dragmode="select",
+        xaxis_title="Thời gian (s)",
+        yaxis_title="Biên độ ADC (units)",
+        hovermode="x unified",
+        uirevision=ch,
+       
+        xaxis=dict(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=1, label="1s", step="second", stepmode="backward"),
+                    dict(count=5, label="5s", step="second", stepmode="backward"),
+                    dict(step="all")
+                ])
+            ),
+            rangeslider=dict(visible=True),
+            range=[0, min(1.0, max_time)]
+        )
+    )
+    return fig
+
+
+# 3. CAPTURE RANGE (Không thay đổi)
+@app.callback(
+    Output("range-store", "data"),
+    Output("selected-range", "children"),
+    Input("emg-graph", "relayoutData")
+)
+def capture_range(data):
+    if not data:
+        raise PreventUpdate
+
+
+    if 'xaxis.range[0]' in data and 'xaxis.range[1]' in data:
+        s = float(data["xaxis.range[0]"])
+        e = float(data["xaxis.range[1]"])
+        s, e = min(s, e), max(s, e)
+        return {"start": s, "end": e}, f"Vùng chọn (Label Range): {s:.4f}s → {e:.4f}s"
+   
+    raise PreventUpdate
+
+
+# 4. HANDLE LABELS (Không thay đổi logic chính)
+@app.callback(
+    Output("label-list", "children"),
+    Input("save-btn", "n_clicks"),
+    Input("update-btn", "n_clicks"),
+    Input("delete-btn", "n_clicks"),
+    Input("channel-select", "options"),
+    State("label-select", "value"),
+    State("range-store", "data"),
+    State("channel-select", "value")
+)
+def handle_labels(save_n, update_n, delete_n, channel_options, name, rng, ch):
+    global labels, selected_label_idx
+
+
+    ctx = callback_context
+    if not ctx.triggered:
+        return render_label_list()
+
+
+    trig = ctx.triggered[0]["prop_id"].split(".")[0]
+   
+    if trig == "channel-select":
+         return render_label_list()
+
+
+    if rng is None or ch is None:
+        raise PreventUpdate
+
+
+    s, e = rng["start"], rng["end"]
+   
+    if s == e and trig != "delete-btn":
+        raise PreventUpdate
+
+
+    if trig == "save-btn":
+        if not name or s == e:
+            raise PreventUpdate
+           
+        labels.append({
+            "channel": ch,
+            "start": s,
+            "end": e,
+            "label": name,
+            "color": LABEL_OPTIONS[name]
+        })
+        selected_label_idx = len(labels) - 1
+
+
+    elif trig == "update-btn" and selected_label_idx is not None:
+        if name:
+            labels[selected_label_idx]["label"] = name
+            labels[selected_label_idx]["color"] = LABEL_OPTIONS[name]
+       
+        labels[selected_label_idx]["start"] = s
+        labels[selected_label_idx]["end"] = e
+        labels[selected_label_idx]["channel"] = ch
+
+
+    elif trig == "delete-btn" and selected_label_idx is not None:
+        labels.pop(selected_label_idx)
+        selected_label_idx = None
+
+
+    return render_label_list()
+
+
+# 5. SELECT LABEL - Cập nhật Dropdown và Store dữ liệu nhãn đã chọn
+@app.callback(
+    Output("label-select", "value"),
+    Output("selected-label-data-store", "data"),
+    Input({"type": "label-item", "index": ALL}, "n_clicks"),
+    State("label-select", "value")
+)
+def select_label(n, current_dropdown_value):
+    global selected_label_idx
+   
+    ctx = callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+       
+    try:
+        prop_id = ctx.triggered[0]["prop_id"]
+        if "label-item" in prop_id:
+            match = re.search(r'"index":(\d+)', prop_id)
+            if match:
+                new_idx = int(match.group(1))
+               
+                # Logic unselect: nếu click lại nhãn đang chọn thì bỏ chọn
+                if new_idx == selected_label_idx:
+                    selected_label_idx = None
+                    return None, None
+                   
+                selected_label_idx = new_idx
+                selected_label = labels[selected_label_idx]
+               
+                # Trả về tên nhãn để hiển thị trong Dropdown và lưu vào Store
+                return selected_label["label"], selected_label
+       
+    except Exception as e:
+        print("Select Label Error:", e)
+        # Nếu có lỗi, giữ nguyên giá trị hiện tại
+        raise PreventUpdate
+       
+    raise PreventUpdate
+
+
+# 6. EXPORT PROJECT (Không thay đổi)
+@app.callback(
+    Output("download-project", "data"),
+    Input("export-btn", "n_clicks")
+)
+def export_project(n):
+    if not n or data_global is None:
+        raise PreventUpdate
+
+
+    output = io.StringIO()
+   
+    # 1. Xuất Metadata
+    output.write(f"# METADATA\n")
+    output.write(f"FS={FS}\n")
+    output.write(f"SAMPLES={len(data_global['ch0'])}\n")
+
+
+    # 2. Xuất dữ liệu gốc (ADC)
+    output.write("\n# ADC_DATA\n")
+    adc_data_str = '\n'.join(map(lambda x: f"{int(x)}", data_global["ch0"]))
+    output.write(adc_data_str)
+
+
+    # 3. Xuất nhãn
+    if labels:
+        output.write("\n\n# LABEL_DATA (JSON LIST)\n")
+        output.write(json.dumps(labels, indent=4))
+
+
+    return dict(content=output.getvalue(), filename="emg_project_labeled.txt")
+
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    app.run(debug=True)
+
